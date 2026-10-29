@@ -1107,6 +1107,32 @@ def group_images_by_shape(
     return grouped_images, *paired_grouped_values, grouped_images_index
 
 
+class _QwenImagePatchBuffer:
+    """Collect grouped image patches in one buffer, preserving the original image order."""
+
+    def __init__(self, images: list["torch.Tensor"], grouped_images_index: dict, patch_size: int):
+        self.num_images = len(images)
+        self.patch_slices = defaultdict(list)
+        self.total_patches = 0
+        for image_index in range(len(images)):
+            shape, group_index = grouped_images_index[image_index]
+            image = images[image_index]
+            num_patches = (image.shape[-2] // patch_size) * (image.shape[-1] // patch_size)
+            self.patch_slices[shape].append((group_index, self.total_patches, self.total_patches + num_patches))
+            self.total_patches += num_patches
+        self.pixel_values = None
+
+    def add(self, shape, patches: "torch.Tensor"):
+        """Store a group's patches in the output buffer."""
+        if patches.shape[0] == self.num_images:
+            self.pixel_values = patches.flatten(0, 1)
+            return
+        if self.pixel_values is None:
+            self.pixel_values = patches.new_empty((self.total_patches, *patches.shape[2:]))
+        for group_index, start, end in self.patch_slices[shape]:
+            self.pixel_values[start:end].copy_(patches[group_index])
+
+
 def reorder_images(
     processed_images: dict[tuple[int, int], "torch.Tensor"],
     grouped_images_index: dict[int | tuple[int, int], tuple[tuple[int, int], int]],

@@ -27,7 +27,7 @@ from torchvision.transforms.v2 import functional as tvF
 
 from ...image_processing_backends import TorchvisionBackend
 from ...image_processing_utils import BatchFeature
-from ...image_transforms import group_images_by_shape, reorder_images
+from ...image_transforms import _QwenImagePatchBuffer, group_images_by_shape, reorder_images
 from ...image_utils import OPENAI_CLIP_MEAN, OPENAI_CLIP_STD, ImageInput, PILImageResampling, SizeDict
 from ...processing_utils import ImagesKwargs, Unpack
 from ...utils import TensorType, auto_docstring
@@ -239,7 +239,7 @@ class MiniMaxM3VLImageProcessor(TorchvisionBackend):
         resized_images = reorder_images(resized_images_grouped, grouped_images_index)
 
         grouped_images, grouped_images_index = group_images_by_shape(resized_images, disable_grouping=disable_grouping)
-        processed_images_grouped = {}
+        patch_buffer = _QwenImagePatchBuffer(resized_images, grouped_images_index, patch_size)
         processed_grids = {}
         for shape, stacked_images in grouped_images.items():
             stacked_images = self.rescale_and_normalize(
@@ -252,16 +252,16 @@ class MiniMaxM3VLImageProcessor(TorchvisionBackend):
                 temporal_patch_size=temporal_patch_size,
             )
 
-            processed_images_grouped[shape] = patches
             processed_grids[shape] = [[1, grid_h, grid_w]] * len(stacked_images)
+            patch_buffer.add(shape, patches)
+            del patches, stacked_images
 
-        processed_images = reorder_images(processed_images_grouped, grouped_images_index)
         processed_grids_ordered = reorder_images(processed_grids, grouped_images_index)
-        pixel_values = processed_images[0] if len(processed_images) == 1 else torch.cat(processed_images, dim=0)
         image_grid_thw = torch.tensor(processed_grids_ordered, dtype=torch.long)
 
         return BatchFeature(
-            data={"pixel_values": pixel_values, "image_grid_thw": image_grid_thw}, tensor_type=return_tensors
+            data={"pixel_values": patch_buffer.pixel_values, "image_grid_thw": image_grid_thw},
+            tensor_type=return_tensors,
         )
 
     def get_number_of_image_patches(self, height: int, width: int, images_kwargs: dict | None = None) -> int:

@@ -20,7 +20,7 @@ import unittest
 import numpy as np
 
 from transformers.models.qwen2_vl.image_processing_qwen2_vl import smart_resize
-from transformers.testing_utils import require_torch, require_vision
+from transformers.testing_utils import require_torch, require_vision, torch_device
 from transformers.utils import is_torch_available, is_vision_available
 
 from ...test_image_processing_common import (
@@ -327,3 +327,122 @@ class Qwen2VLImageProcessingTest(ImageProcessingTestMixin, unittest.TestCase):
                 height=100, width=100, images_kwargs={"patch_size": 28}
             )
             self.assertEqual(num_patches, 16)
+
+    def test_batch_patchification_matches_individual_images(self):
+        """A shared patch buffer must preserve image order, values, dtype, and input ownership."""
+        cls = self.image_processing_classes["torchvision"]
+        for dtype, grouping, patch_config, transforms in itertools.product(
+            (torch.uint8, torch.float32),
+            (None, True, False),
+            ((14, 2, 2), (16, 1, 1)),
+            itertools.product((False, True), repeat=2),
+        ):
+            with self.subTest(dtype=dtype, grouping=grouping, patches=patch_config, transforms=transforms):
+                patch_size, merge_size, temporal_patch_size = patch_config
+                do_rescale, do_normalize = transforms
+                processor = cls(
+                    do_resize=False,
+                    do_rescale=do_rescale,
+                    do_normalize=do_normalize,
+                    patch_size=patch_size,
+                    merge_size=merge_size,
+                    temporal_patch_size=temporal_patch_size,
+                )
+                factor = patch_size * merge_size
+                shapes = [(2 * factor, 3 * factor), (3 * factor, 2 * factor), (2 * factor, 3 * factor)]
+                generator = torch.Generator().manual_seed(0)
+                images = [
+                    torch.randint(0, 256, (3, h, w), generator=generator).to(device=torch_device, dtype=dtype)
+                    for h, w in shapes
+                ]
+                originals = [image.clone() for image in images]
+                expected = [processor(image, return_tensors="pt") for image in images]
+
+                actual = processor(images, return_tensors="pt", disable_grouping=grouping)
+
+                torch.testing.assert_close(
+                    actual.pixel_values, torch.cat([item.pixel_values for item in expected]), rtol=0, atol=0
+                )
+                torch.testing.assert_close(
+                    actual.image_grid_thw, torch.cat([item.image_grid_thw for item in expected])
+                )
+                for image, original in zip(images, originals):
+                    torch.testing.assert_close(image, original, rtol=0, atol=0)
+
+    def test_single_group_patchification_reuses_patch_storage(self):
+        """A single shape group must reuse patch storage while retaining its gradients."""
+        cls = self.image_processing_classes["torchvision"]
+
+        class CapturePatchProcessor(cls):
+            def patchify(self, images, patch_size, merge_size, temporal_patch_size):
+                patches, grid_h, grid_w = super().patchify(images, patch_size, merge_size, temporal_patch_size)
+                self.patches = patches
+                return patches, grid_h, grid_w
+
+        for batch_size, grouping in ((1, None), (1, True), (1, False), (3, False)):
+            with self.subTest(batch_size=batch_size, grouping=grouping):
+                processor = CapturePatchProcessor(do_resize=False, do_rescale=False, do_normalize=False)
+                images = torch.randn(batch_size, 3, 56, 84, device=torch_device, requires_grad=True)
+                image_inputs = images[0] if batch_size == 1 else images
+                output = processor(image_inputs, return_tensors="pt", disable_grouping=grouping).pixel_values
+
+                self.assertEqual(output.data_ptr(), processor.patches.data_ptr())
+                torch.testing.assert_close(output, processor.patches.flatten(0, 1), rtol=0, atol=0)
+                gradient = torch.autograd.grad(output.square().sum(), images)[0]
+                torch.testing.assert_close(gradient, 2 * processor.temporal_patch_size * images)
+
+    def test_batch_patchification_preserves_subclass_override(self):
+        """Batch processing must continue to honor the public patchification hook."""
+        cls = self.image_processing_classes["torchvision"]
+
+        class CustomPatchProcessor(cls):
+            def patchify(self, images, patch_size, merge_size, temporal_patch_size):
+                patches, grid_h, grid_w = super().patchify(images, patch_size, merge_size, temporal_patch_size)
+                return patches.flip(1), grid_h, grid_w
+
+        processor = CustomPatchProcessor(do_resize=False)
+        images = [torch.arange(3 * 56 * 56, dtype=torch.float32).reshape(3, 56, 56)] * 2
+        expected = torch.cat([processor(image, return_tensors="pt").pixel_values for image in images])
+
+        actual = processor(images, return_tensors="pt")
+
+        torch.testing.assert_close(actual.pixel_values, expected, rtol=0, atol=0)
+
+    def test_grouped_patchification_preserves_gradients(self):
+        """Interleaved shape groups must preserve patch values and gradients."""
+        cls = self.image_processing_classes["torchvision"]
+        for do_normalize, do_rescale in itertools.product((False, True), repeat=2):
+            with self.subTest(do_normalize=do_normalize, do_rescale=do_rescale):
+                processor = cls(do_resize=False, do_rescale=do_rescale, do_normalize=do_normalize)
+                generator = torch.Generator().manual_seed(0)
+                images = [
+                    torch.randn(shape, dtype=dtype, generator=generator).to(torch_device).requires_grad_()
+                    for shape, dtype in (
+                        ((3, 56, 84), torch.float32),
+                        ((3, 84, 56), torch.float32),
+                        ((3, 56, 84), torch.float32),
+                    )
+                ]
+                expected_patches = []
+                for image in images:
+                    normalized = processor.rescale_and_normalize(
+                        image.unsqueeze(0),
+                        do_rescale,
+                        processor.rescale_factor,
+                        do_normalize,
+                        processor.image_mean,
+                        processor.image_std,
+                    )
+                    patches, _, _ = processor.patchify(
+                        normalized, processor.patch_size, processor.merge_size, processor.temporal_patch_size
+                    )
+                    expected_patches.append(patches[0])
+                expected = torch.cat(expected_patches)
+
+                actual = processor(images, return_tensors="pt", disable_grouping=False).pixel_values
+
+                torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+                actual_grads = torch.autograd.grad(actual.square().sum(), images)
+                expected_grads = torch.autograd.grad(expected.square().sum(), images)
+                for actual_grad, expected_grad in zip(actual_grads, expected_grads):
+                    torch.testing.assert_close(actual_grad, expected_grad)
